@@ -18,7 +18,7 @@ model = AutoModelForCausalLM.from_pretrained(
     use_safetensors=True
 )
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, cache_dir=cache_dir)
-base_path = Path("~/koa_scratch/ECE405/assignment4").expanduser()
+base_path = Path("~/koa_scratch/ECE405/assignment3").expanduser()
 target_directory = base_path / model_name
 target_directory.mkdir(parents=True, exist_ok=True)
 tokenizer.save_pretrained(target_directory)
