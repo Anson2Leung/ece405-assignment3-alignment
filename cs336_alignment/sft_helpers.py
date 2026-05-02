@@ -4,6 +4,7 @@ from transformers import PreTrainedModel
 import numpy as np
 from vllm import SamplingParams
 
+
 def tokenize_prompt_and_output(prompt_strs: list[str], output_strs: list[str], tokenizer) -> dict[str, torch.Tensor]:
     batch_input_ids = []
     batch_labels = []
@@ -62,8 +63,6 @@ def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     # H(p) = -sum(p * log(p))
     log_probs = F.log_softmax(logits, dim=-1)
     probs = torch.exp(log_probs)
-    
-    # Summing across dim=-1 reduces to a single value
     entropy = -torch.sum(probs * log_probs, dim=-1)
     return entropy
 
@@ -77,11 +76,9 @@ def get_response_log_probs(
     
     # Get logits for next token (batch_size, sequence_length, vocab_size)
     logits = model(input_ids).logits
-    
-    # numerically stable log prob
     log_probs = F.log_softmax(logits, dim=-1)
     
-    # Gather the log prob for the actual tokens in labels log_probs shape after squeeze (batch_size, sequence_length)
+    # Gather the log prob for the actual tokens in labels
     log_probs = torch.gather(log_probs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
     result = {"log_probs": log_probs}
     
@@ -99,16 +96,15 @@ def masked_normalize(
     normalize_constant: float = 1.0,
 ) -> torch.Tensor:
 
-    # Zero out the elements we want to ignore
+    # Zero out based on mask
     masked_tensor = tensor * mask
     
-    # Sum tensor or dimension
     if dim is None:
         sum = torch.sum(masked_tensor)
     else:
         sum = torch.sum(masked_tensor, dim=dim)
         
-    # Normalize by dividing by the provided constant
+    # Normalize
     return sum / normalize_constant
 
 
@@ -118,11 +114,8 @@ def sft_microbatch_train_step(
     gradient_accumulation_steps: int,
     normalize_constant: None = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """
-    Execute a forward-and-backward pass on a microbatch for SFT.
-    """
 
-    # loss per token for response only (masked with 1)
+    # loss per token for response (masked with 1)
     per_token_loss = -policy_log_probs * response_mask
     
     # Sum the valid losses and apply normalization
@@ -141,79 +134,117 @@ def sft_microbatch_train_step(
     
     return accumulated_loss.detach(), metadata
 
+def evaluate_accuracy(
+    llm,
+    val_samples: list[dict],
+    reward_fn,
+    batch_size: int = 32,
+) -> float:
+
+    sampling_params = SamplingParams(
+        temperature=0.0, 
+        max_tokens=1024, 
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
+    )
+    
+    prompts = [s["formatted_prompt"] for s in val_samples]
+    answers = [s.get("answer", s.get("solution", "")) for s in val_samples]
+
+    correct = 0
+    for start in range(0, len(prompts), batch_size):
+        batch_p = prompts[start : start + batch_size]
+        batch_a = answers[start : start + batch_size]
+        outputs = llm.generate(batch_p, sampling_params)
+        
+        for output, ans in zip(outputs, batch_a):
+            completion = output.outputs[0].text
+            reward_info = reward_fn(completion, ans)
+            correct += int(reward_info.get("reward", 0.0) > 0.5)
+
+    return correct / len(prompts) if prompts else 0.0
+
+
 def log_generations(
-    llm, 
+    llm,
     policy_model, 
-    tokenizer, 
-    val_samples: list[dict], 
-    reward_fn, 
+    tokenizer,
+    val_samples: list[dict],
+    reward_fn,
     num_to_log: int = 8
-) -> dict:
-    """
-    Generates completions, evaluates them, and computes statistics for logging.
-    """
-    # 1. Setup vLLM Generation
-    # temperature=0.0 (greedy) is standard for validation to reduce variance
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=1024, stop=["</answer>"])
+):
+
+    sampling_params = SamplingParams(
+        temperature=0.0, 
+        max_tokens=1024, 
+        stop=["</answer>"],
+        include_stop_str_in_output=True
+    )
     
-    prompts = [s["formatted_prompt"] for s in val_samples[:num_to_log]]
-    solutions = [s["solution"] for s in val_samples[:num_to_log]]
+    prompts = [s["formatted_prompt"] for s in val_samples]
+    ground_truths = [s.get("answer", s.get("solution", "")) for s in val_samples]
     
-    # 2. Batch Generation
     outputs = llm.generate(prompts, sampling_params)
     
     table_data = []
+    
+    # Tstats to graph
     all_stats = {
         "lengths": [], 
         "correct_lengths": [], 
         "incorrect_lengths": [], 
         "entropies": [], 
-        "rewards": []
+        "rewards": [],
+        "format_rewards": [],
+        "answer_rewards": []
     }
 
     for i, output in enumerate(outputs):
-        generated_text = output.outputs[0].text
-        # Ensure we keep the <think> tag if vLLM stripped it or if it's part of the response
-        full_completion = generated_text 
+        full_completion = output.outputs[0].text
         
-        # 3. Reward Calculation
-        # Assuming reward_fn returns a dict: {"total": float, "format": float, "answer": float}
-        reward_info = reward_fn(full_completion, solutions[i])
-        total_reward = reward_info.get("total", 0.0)
+        # Reward Calculations
+        reward_info = reward_fn(full_completion, ground_truths[i])
+        total_reward = reward_info.get("reward", 0.0)
+        format_reward = reward_info.get("format_reward", 0.0)
+        answer_reward = reward_info.get("answer_reward", 0.0)
         
-        # 4. Entropy Calculation
-        # We must re-tokenize the generated text to get logits from the policy model
+        # Entropy Calculation
         enc = tokenizer(full_completion, return_tensors="pt").to(policy_model.device)
         with torch.no_grad():
             logits = policy_model(**enc).logits
             entropy_tensor = compute_entropy(logits) 
             avg_entropy = entropy_tensor.mean().item()
 
-        # 5. Length Stats
+        # Length Stats
         resp_len = len(output.outputs[0].token_ids)
         all_stats["lengths"].append(resp_len)
         all_stats["entropies"].append(avg_entropy)
-        all_stats["rewards"].append(total_reward)
         
-        if total_reward > 0.5: # Threshold for 'correct'
+        # Accumulate metrics for the graphs
+        all_stats["rewards"].append(total_reward)
+        all_stats["format_rewards"].append(format_reward)
+        all_stats["answer_rewards"].append(answer_reward)
+        
+        if total_reward > 0.5:
             all_stats["correct_lengths"].append(resp_len)
         else:
             all_stats["incorrect_lengths"].append(resp_len)
 
-        # 6. Format data for a WandB Table
+        # Remove system prompt
+        clean_question = prompts[i].split("User:")[-1].split("Assistant:")[0].strip()
+        
         table_data.append([
-            prompts[i], 
-            full_completion, 
-            solutions[i], 
-            total_reward, 
-            reward_info.get("format", 0.0), 
-            reward_info.get("answer", 0.0), 
-            avg_entropy
+            prompts[i],
+            clean_question, 
+            ground_truths[i],
+            full_completion,
+            total_reward
         ])
 
-    # 7. Aggregate Metrics
     metrics = {
         "val/avg_reward": np.mean(all_stats["rewards"]),
+        "val/avg_format_reward": np.mean(all_stats["format_rewards"]),
+        "val/avg_answer_reward": np.mean(all_stats["answer_rewards"]),
         "val/avg_entropy": np.mean(all_stats["entropies"]),
         "val/avg_response_length": np.mean(all_stats["lengths"]),
         "val/avg_len_correct": np.mean(all_stats["correct_lengths"]) if all_stats["correct_lengths"] else 0.0,
