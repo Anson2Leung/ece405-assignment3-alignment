@@ -10,38 +10,41 @@ def compute_group_normalized_rewards(
     normalize_by_std: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     
-    # Scores the rollout responses against the ground truths (keys "reward", "format_reward", and "answer_reward")
     raw_rewards_list = []
+    format_rewards_list = []
+    answer_rewards_list = []
+    
     for response, truth in zip(rollout_responses, repeated_ground_truths):
         score_dict = reward_fn(response, truth)
-        raw_rewards_list.append(score_dict.get("reward"))
+        raw_rewards_list.append(score_dict.get("reward", 0.0))
+        format_rewards_list.append(score_dict.get("format_reward", 0.0))
+        answer_rewards_list.append(score_dict.get("answer_reward", 0.0))
 
-    # group rewards based on prompt
     raw_rewards = torch.tensor(raw_rewards_list, dtype=torch.float32)
-    grouped_rewards = raw_rewards.view(-1, group_size)
+    format_rewards = torch.tensor(format_rewards_list, dtype=torch.float32)
+    answer_rewards = torch.tensor(answer_rewards_list, dtype=torch.float32)
 
-    #  Group reward (mean(r(1), r(2), . . . , r(G)))
+    grouped_rewards = raw_rewards.view(-1, group_size)
     group_means = grouped_rewards.mean(dim=1, keepdim=True)
     
-    if normalize_by_std:
-        # group-normalized reward (28)
+    # prevents NaN when group_size=1 during evaluation
+    if normalize_by_std and group_size > 1:
         group_stds = grouped_rewards.std(dim=1, keepdim=True)
         grouped_advantages = (grouped_rewards - group_means) / (group_stds + advantage_eps)
     else:
-        # group-normalized rewards simplified (31)
         grouped_advantages = grouped_rewards - group_means
     
-    # reshape (rollout_batch_size,)
     advantages = grouped_advantages.reshape(-1)
     
-    # Collect metadata for logging
     metadata = {
         "reward/mean": raw_rewards.mean().item(),
-        "reward/std": raw_rewards.std().item(),
-        "reward/max": raw_rewards.max().item(),
-        "reward/min": raw_rewards.min().item(),
+        "reward/std": raw_rewards.std().item() if len(raw_rewards) > 1 else 0.0,
+        "format_reward/mean": format_rewards.mean().item(),
+        "answer_reward/mean": answer_rewards.mean().item(),
+        # get average
+        "accuracy": (answer_rewards > 0.5).float().mean().item(), 
         "advantage/mean": advantages.mean().item(),
-        "advantage/std": advantages.std().item(),
+        "advantage/std": advantages.std().item() if len(advantages) > 1 else 0.0,
     }
     
     return advantages, raw_rewards, metadata
@@ -81,8 +84,8 @@ def compute_grpo_clip_loss(
     is_clipped = (right < left).to(torch.float32)
     
     metadata = {
-        "clip_fraction": is_clipped.mean(), # Global average for quick logging
-        "is_clipped": is_clipped           # Per-token mask for granular analysis
+        "clip_fraction": is_clipped.mean(),
+        "is_clipped": is_clipped 
     }
     
     return loss, metadata
@@ -90,7 +93,7 @@ def compute_grpo_clip_loss(
 
 def compute_policy_gradient_loss(
     policy_log_probs: torch.Tensor,
-    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip", "grpo_no_clip"],
     raw_rewards: torch.Tensor | None = None,
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
@@ -116,7 +119,7 @@ def compute_policy_gradient_loss(
         assert old_log_probs is not None, "'old_log_probs Required for \"grpo_clip\"; shape (batch_size, sequence_length).'"
         assert old_log_probs.shape == (batch_size, seq_len), f"Expected old_log_probs {policy_log_probs.shape}, got {old_log_probs.shape}"
         assert cliprange is not None, "'cliprange Required for \"grpo_clip\"; scalar ϵ used for clipping.'"
-        
+
         loss, clip_metadata = compute_grpo_clip_loss(
             advantages, 
             policy_log_probs, 
@@ -124,6 +127,14 @@ def compute_policy_gradient_loss(
             cliprange
         )
         metadata.update(clip_metadata)
+
+    elif loss_type == "grpo_no_clip":
+        # needs advantage, policy, old policy
+        assert advantages is not None, "'advantages Required for \grpo_no_clip\; shape (batch_size, 1).'"
+        assert old_log_probs is not None, "'old_log_probs Required for \"grpo_clip\"; shape (batch_size, sequence_length).'"
+        
+        ratio = torch.exp(policy_log_probs - old_log_probs)
+        loss = -(ratio * advantages) 
 
     else:
         raise ValueError(f"Invalid loss_type: {loss_type}")
@@ -158,11 +169,12 @@ def grpo_microbatch_train_step(
     policy_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
     gradient_accumulation_steps: int,
-    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip", "grpo_no_clip"],
     raw_rewards: Optional[torch.Tensor] = None,
     advantages: Optional[torch.Tensor] = None,
     old_log_probs: Optional[torch.Tensor] = None,
     cliprange: Optional[float] = None,
+    use_length_normalization: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
     # compute the per-token loss
@@ -176,7 +188,13 @@ def grpo_microbatch_train_step(
     )
     
     # masked_mean to aggregate to a scalar loss per example
-    loss_per_example = masked_mean(tensor=per_token_loss, mask=response_mask, dim=1)
+    masked_tensor = per_token_loss * response_mask
+    if use_length_normalization:
+        # Average over the sequence length
+        loss_per_example = masked_tensor.sum(dim=1) / response_mask.sum(dim=1)
+    else:
+        # Sum over the sequence length (Lambert 2024 formulation)
+        loss_per_example = masked_tensor.sum(dim=1)
     
     # average over the batch dimension
     avg_batch_loss = loss_per_example.mean()
@@ -187,7 +205,7 @@ def grpo_microbatch_train_step(
     # backward pass
     scaled_loss.backward()
     
-    # metadata from loss 
+    # metadata for loss 
     metadata["loss/scaled_microbatch"] = scaled_loss.detach()
     metadata["loss/unscaled_microbatch"] = avg_batch_loss.detach()
     
