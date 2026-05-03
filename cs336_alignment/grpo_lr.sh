@@ -24,7 +24,7 @@ echo "Job ${SLURM_JOB_ID}, task ${SLURM_ARRAY_TASK_ID}: GRPO learning_rate=${LR}
 
 ROLLOUT_BATCH=64    # Reduced from 256
 TRAIN_BATCH=64      # Reduced from 256
-GRAD_ACCUM=32       # Reduced from 128 Scaled to match given
+GRAD_ACCUM=32       # Reduced from 128
 
 uv run python grpo_train.py \
     --model-id                    /home/ansonl32/koa_scratch/ECE405/assignment3/Qwen/Qwen2.5-Math-1.5B \

@@ -10,7 +10,7 @@
 #SBATCH --error=/home/ansonl32/ECE405/ece405-assignment3-alignment/cs336_alignment/outputs/logs/grpo_length_norm_%A_%a.err
 
 cd /home/ansonl32/ECE405/ece405-assignment3-alignment/cs336_alignment
-export WANDB_API_KEY="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"
+export WANDB_API_KEY=""
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 mkdir -p /home/ansonl32/ECE405/ece405-assignment3-alignment/cs336_alignment/outputs/logs

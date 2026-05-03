@@ -19,7 +19,7 @@ app = typer.Typer()
 
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
     vllm_set_random_seed(seed)
-    # Auto-detect dtype — bfloat16 requires compute capability >= 8.0
+    # Auto-detect dtype bfloat16 
     vllm_dtype = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
     print(f"vLLM dtype: {vllm_dtype}")
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
